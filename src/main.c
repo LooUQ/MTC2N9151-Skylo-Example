@@ -16,6 +16,7 @@
 
 #include <zephyr/shell/shell.h>
 
+#include <date_time.h>
 #include <modem/lte_lc.h>
 #include <modem/nrf_modem_lib.h>
 #include <modem/ntn.h>
@@ -27,6 +28,14 @@ K_SEM_DEFINE(lte_connected, 0, 1);
  * manually with the "udp send <text>" shell command. -1 until registered.
  */
 static int udp_fd = -1;
+
+/* Running field-test tallies. cycles counts periodic loop iterations; good
+ * sends/receives count successful send()/recv() calls (including manual
+ * "udp send", which also flows through udp_send_and_recv()).
+ */
+static unsigned int total_cycles;
+static unsigned int good_sends;
+static unsigned int good_recvs;
 
 /* Advance past any characters that cannot start a number (quotes, commas,
  * spaces), so the CONFIG_NTN_LOCATION string can be tokenized with strtod
@@ -390,7 +399,9 @@ static void udp_send_and_recv(int fd, const void *payload, size_t payload_len)
 
 	len = send(fd, payload, payload_len, 0);
 	if (len == (ssize_t)payload_len) {
-		printk("Sent %d bytes\n", len);
+		good_sends++;
+		printk("Sent %d bytes: %.*s\n", len, (int)payload_len,
+		       (const char *)payload);
 	} else {
 		printk("Send failed, error: %d, errno: %d\n", len, errno);
 		return;
@@ -398,11 +409,19 @@ static void udp_send_and_recv(int fd, const void *payload, size_t payload_len)
 
 	len = recv(fd, buffer, sizeof(buffer) - 1, 0);
 	if (len > 0) {
+		good_recvs++;
 		buffer[len] = '\0';
 		printk("Received %d bytes: %s\n", len, buffer);
 	} else if (len < 0) {
 		printk("Receive failed, error: %d, errno: %d\n", len, errno);
 	}
+}
+
+/* Print the running send/receive tallies. */
+static void log_tally(void)
+{
+	printk("Tally: cycles=%u good_sends=%u good_recvs=%u\n",
+	       total_cycles, good_sends, good_recvs);
 }
 
 /* Read the satellite link quality once registered. %CONEVAL is rejected in
@@ -448,17 +467,33 @@ static void log_signal_quality(void)
 	}
 }
 
-/* Render CONFIG_TEST_TEMPLATE into out, expanding the %-tokens documented in
- * Kconfig (%n %c %r %q %u %%). Unknown tokens are copied through verbatim.
- * Returns the payload length (excluding the NUL terminator), or -1 if it does
- * not fit in out_size.
+/* Unix epoch seconds (UTC) from the NCS date_time library. date_time obtains
+ * the time from modem/network time (NITZ) first and falls back to NTP over the
+ * IP connection, so it works even when the satellite network does not push time
+ * directly. There is no battery RTC, so it returns 0 until a time has been
+ * obtained from some source - the first send or two after boot may carry 0.
+ */
+static int64_t read_unix_time(void)
+{
+	int64_t unix_time_ms;
+
+	if (date_time_now(&unix_time_ms) != 0) {
+		return 0;
+	}
+	return unix_time_ms / 1000;
+}
+
+/* Render CONFIG_TEST_PAYLOADTEMPLATE into out, expanding the %-tokens documented
+ * in Kconfig (%n %i %h %c %r %q %t %%). Unknown tokens are copied through
+ * verbatim. Returns the payload length (excluding the NUL terminator), or -1 if
+ * it does not fit in out_size.
  */
 static int render_payload(char *out, size_t out_size, unsigned int counter)
 {
 	int rsrp = 0;
 	double rsrq = 0.0;
 	bool have_signal = (read_signal_quality(&rsrp, &rsrq) == 0);
-	const char *p = CONFIG_TEST_TEMPLATE;
+	const char *p = CONFIG_TEST_PAYLOADTEMPLATE;
 	size_t n = 0;
 
 	while (*p != '\0') {
@@ -477,7 +512,14 @@ static int render_payload(char *out, size_t out_size, unsigned int counter)
 		case 'n':
 			w = snprintf(out + n, out_size - n, "%s", CONFIG_TEST_NAME);
 			break;
-		case 'c':
+
+		case 'i':
+			w = snprintf(out + n, out_size - n, "%s", CONFIG_TAGO_DEVICE_TOKEN);
+			break;
+		case 'h':
+			w = snprintf(out + n, out_size - n, "%s", CONFIG_TAGO_HASH);
+			break;
+        case 'c':
 			w = snprintf(out + n, out_size - n, "%u", counter);
 			break;
 		case 'r':
@@ -486,9 +528,9 @@ static int render_payload(char *out, size_t out_size, unsigned int counter)
 		case 'q':
 			w = snprintf(out + n, out_size - n, "%.1f", have_signal ? rsrq : 0.0);
 			break;
-		case 'u':
-			w = snprintf(out + n, out_size - n, "%u",
-				     (unsigned int)(k_uptime_get() / 1000));
+		case 't':
+			w = snprintf(out + n, out_size - n, "%lld",
+				     (long long)read_unix_time());
 			break;
 		case '%':
 			w = snprintf(out + n, out_size - n, "%%");
@@ -555,6 +597,7 @@ static int cmd_udp_status(const struct shell *sh, size_t argc, char **argv)
 
 	log_signal_quality();
 	log_modem_status();
+	log_tally();
 
 	return 0;
 }
@@ -609,11 +652,13 @@ int main(void)
 		char payload[256];
 		int len = render_payload(payload, sizeof(payload), counter);
 
+		total_cycles++;
 		if (len < 0) {
 			printk("Payload does not fit buffer; check CONFIG_TEST_TEMPLATE\n");
 		} else {
 			udp_send_and_recv(udp_fd, payload, len);
 		}
+		log_tally();
 
 		k_sleep(K_SECONDS(CONFIG_TEST_INTERVAL));
 	}

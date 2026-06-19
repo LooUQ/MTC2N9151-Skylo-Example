@@ -41,16 +41,24 @@ config TEST_INTERVAL
     int "Interval between UDP transmissions (s)"
     default 10
 
-config TEST_TEMPLATE
+config TAGO_DEVICE_TOKEN
+    string "Device identifier token for payloads"
+    default "355025937426409"
+
+config TAGO_HASH
+    string "Device hash token for payloads"
+    default "ae82ad617197d3b0"
+
+config TEST_PAYLOADTEMPLATE
     string "Payload template sent every TEST_INTERVAL seconds"
-    default "%n seq=%c rsrp=%r rsrq=%q up=%u"
+    default "[tid=%n;seq:=%c;rsrp:=%r;rsrq:=%q]"
     help
       Sent verbatim except for these tokens, expanded at send time:
         %n  test name (CONFIG_TEST_NAME)
         %c  send counter (increments each interval)
         %r  RSRP in dBm (0 if not detectable)
         %q  RSRQ in dB  (0 if not detectable)
-        %u  uptime in seconds
+        %t  Unix epoch seconds from modem time (0 if network time unset)
         %%  a literal '%'
 
 endmenu
