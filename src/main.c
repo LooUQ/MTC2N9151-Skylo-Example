@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -36,6 +37,10 @@ static int udp_fd = -1;
 static unsigned int total_cycles;
 static unsigned int good_sends;
 static unsigned int good_recvs;
+
+/* log_tally() reads the time, but read_unix_time() is defined later with the
+ * other modem helpers. */
+static int64_t read_unix_time(void);
 
 /* Advance past any characters that cannot start a number (quotes, commas,
  * spaces), so the CONFIG_NTN_LOCATION string can be tokenized with strtod
@@ -207,7 +212,8 @@ static void set_initial_location(void)
 		       nrf_modem_at_err_type(err), nrf_modem_at_err(err));
 		return;
 	}
-	printk("Initial NTN location set from CONFIG_NTN_LOCATION\n");
+	printk("Initial NTN location set from CONFIG_NTN_LOCATION: "
+	       "lat %.6f, lon %.6f, alt %.1f m\n", lat, lon, (double)alt);
 }
 
 static void modem_init(void)
@@ -417,11 +423,25 @@ static void udp_send_and_recv(int fd, const void *payload, size_t payload_len)
 	}
 }
 
-/* Print the running send/receive tallies. */
+/* Print the running send/receive tallies, prefixed with the current time as
+ * UTC (converted from the date_time epoch). Shows "unknown" until time is
+ * acquired.
+ */
 static void log_tally(void)
 {
-	printk("Tally: cycles=%u good_sends=%u good_recvs=%u\n",
-	       total_cycles, good_sends, good_recvs);
+	int64_t epoch = read_unix_time();
+	char when[32] = "unknown";
+
+	if (epoch > 0) {
+		time_t t = (time_t)epoch;
+		struct tm tm;
+
+		gmtime_r(&t, &tm);
+		strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S UTC", &tm);
+	}
+
+	printk("Tally: time=%s cycles=%u good_sends=%u good_recvs=%u\n",
+	       when, total_cycles, good_sends, good_recvs);
 }
 
 /* Read the satellite link quality once registered. %CONEVAL is rejected in
@@ -452,10 +472,62 @@ static int read_signal_quality(int *rsrp_dbm, double *rsrq_db)
 	return 0;
 }
 
+/* Read the <snr> field from %XMONITOR and decode it to dB. %CONEVAL (the usual
+ * SNR source) is rejected in NTN mode, but %XMONITOR carries it:
+ *   <reg_status>,<full_name>,<short_name>,<plmn>,<tac>,<AcT>,<band>,<cell_id>,
+ *   <phys_cell_id>,<EARFCN>,<rsrp>,<snr>,...
+ * SNR is reported as an index: dB = value - 24; 127 = not known/not detectable.
+ * Returns 0 and fills *snr_db on success, 1 if SNR is unavailable, -1 on error.
+ */
+#define XMONITOR_SNR_FIELD 11
+
+static int read_snr(int *snr_db)
+{
+	char resp[160];
+	const char *p;
+	int field = 0;
+	bool in_quote = false;
+	int snr_index;
+
+	if (nrf_modem_at_cmd(resp, sizeof(resp), "AT%%XMONITOR")) {
+		return -1;
+	}
+
+	p = strchr(resp, ' '); /* skip past "%XMONITOR:" */
+	if (p == NULL) {
+		return -1;
+	}
+	p++;
+
+	/* Advance to the start of the SNR field, ignoring commas inside the quoted
+	 * operator-name/PLMN/TAC/cell-id fields.
+	 */
+	while (*p != '\0' && field < XMONITOR_SNR_FIELD) {
+		if (*p == '"') {
+			in_quote = !in_quote;
+		} else if (*p == ',' && !in_quote) {
+			field++;
+		}
+		p++;
+	}
+	if (field != XMONITOR_SNR_FIELD || *p == '\0' || *p == ',') {
+		return 1; /* not registered yet / field empty */
+	}
+
+	snr_index = atoi(p);
+	if (snr_index == 127) {
+		return 1; /* not known or not detectable */
+	}
+
+	*snr_db = snr_index - 24;
+	return 0;
+}
+
 static void log_signal_quality(void)
 {
 	int rsrp;
 	double rsrq;
+	int snr_db;
 	int ret = read_signal_quality(&rsrp, &rsrq);
 
 	if (ret < 0) {
@@ -464,6 +536,12 @@ static void log_signal_quality(void)
 		printk("Signal quality: RSRP not detectable\n");
 	} else {
 		printk("Signal quality: RSRP %d dBm, RSRQ %.1f dB\n", rsrp, rsrq);
+	}
+
+	if (read_snr(&snr_db) == 0) {
+		printk("Signal quality: SNR %d dB\n", snr_db);
+	} else {
+		printk("Signal quality: SNR not available\n");
 	}
 }
 
@@ -484,7 +562,7 @@ static int64_t read_unix_time(void)
 }
 
 /* Render CONFIG_TEST_PAYLOADTEMPLATE into out, expanding the %-tokens documented
- * in Kconfig (%n %i %h %c %r %q %t %%). Unknown tokens are copied through
+ * in Kconfig (%n %i %h %c %r %q %s %t %%). Unknown tokens are copied through
  * verbatim. Returns the payload length (excluding the NUL terminator), or -1 if
  * it does not fit in out_size.
  */
@@ -492,7 +570,9 @@ static int render_payload(char *out, size_t out_size, unsigned int counter)
 {
 	int rsrp = 0;
 	double rsrq = 0.0;
+	int snr_db = 0;
 	bool have_signal = (read_signal_quality(&rsrp, &rsrq) == 0);
+	bool have_snr = (read_snr(&snr_db) == 0);
 	const char *p = CONFIG_TEST_PAYLOADTEMPLATE;
 	size_t n = 0;
 
@@ -531,6 +611,9 @@ static int render_payload(char *out, size_t out_size, unsigned int counter)
 		case 't':
 			w = snprintf(out + n, out_size - n, "%lld",
 				     (long long)read_unix_time());
+			break;
+		case 's':
+			w = snprintf(out + n, out_size - n, "%d", have_snr ? snr_db : 0);
 			break;
 		case '%':
 			w = snprintf(out + n, out_size - n, "%%");

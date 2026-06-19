@@ -55,9 +55,12 @@ config TEST_PAYLOADTEMPLATE
     help
       Sent verbatim except for these tokens, expanded at send time:
         %n  test name (CONFIG_TEST_NAME)
+        %i  device token (CONFIG_TAGO_DEVICE_TOKEN)
+        %h  device hash (CONFIG_TAGO_HASH)
         %c  send counter (increments each interval)
         %r  RSRP in dBm (0 if not detectable)
         %q  RSRQ in dB  (0 if not detectable)
+        %s  SNR in dB from %XMONITOR (0 if not available)
         %t  Unix epoch seconds from modem time (0 if network time unset)
         %%  a literal '%'
 
