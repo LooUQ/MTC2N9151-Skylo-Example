@@ -4,23 +4,59 @@
 # SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
 #
 
-menu "NIDD Sample Settings"
+menu "UDP Sample Settings"
 
-config NIDD_APN
-	string "APN used for NIDD connection"
-	default ""
+config UDP_APN
+	string "APN used for the IP connection"
+	default "nbiot"
 
-config NIDD_ALLOC_NEW_CID
-	bool "Allocate new context identifier for NIDD connection"
+config UDP_ALLOC_NEW_CID
+	bool "Allocate a new (dedicated) context identifier for the connection"
 
-config NIDD_PAYLOAD
-	string "Payload for NIDD transmission"
+config UDP_SERVER_ADDRESS
+	string "UDP server hostname or IP address"
+	default "192.0.2.1"
+
+config UDP_SERVER_PORT
+	int "UDP server port"
+	default 4242
+
+config UDP_PAYLOAD
+	string "Payload for UDP transmission"
 	default "Hello, World!"
+
+config NTN_LOCATION
+	string "Location information for NTN (lat,lon,alt)"
+	default "44.698883,-85.600258,153.025009"
+
+config NTN_BAND_LIST
+	string "NTN band list for AT%XBANDLOCK (comma-separated)"
+	default "23,255,256"
+
+config TEST_NAME
+    string "Test name to use in the payload"
+    default "UDP Sample Test"
+
+config TEST_INTERVAL
+    int "Interval between UDP transmissions (s)"
+    default 10
+
+config TEST_TEMPLATE
+    string "Payload template sent every TEST_INTERVAL seconds"
+    default "%n seq=%c rsrp=%r rsrq=%q up=%u"
+    help
+      Sent verbatim except for these tokens, expanded at send time:
+        %n  test name (CONFIG_TEST_NAME)
+        %c  send counter (increments each interval)
+        %r  RSRP in dBm (0 if not detectable)
+        %q  RSRQ in dB  (0 if not detectable)
+        %u  uptime in seconds
+        %%  a literal '%'
 
 endmenu
 
-module = NIDD
-module-str = NIDD sample
+module = UDP
+module-str = UDP sample
 
 menu "Zephyr Kernel"
 source "Kconfig.zephyr"
