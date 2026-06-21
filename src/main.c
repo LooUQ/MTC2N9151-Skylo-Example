@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
  */
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -340,7 +341,7 @@ static int udp_socket_setup(int pdn_id)
 	};
 	struct addrinfo *res;
 	struct timeval recv_timeout = {
-		.tv_sec = 5
+		.tv_sec = CONFIG_UDP_RECV_TIMEOUT_S
 	};
 	int fd, err;
 
@@ -413,11 +414,24 @@ static void udp_send_and_recv(int fd, const void *payload, size_t payload_len)
 		return;
 	}
 
+	/* Give the reply time to arrive before listening for it. On high-latency
+	 * NTN links the response is not back immediately, so a short gap between
+	 * send and receive avoids burning the recv timeout on an empty socket.
+	 */
+	if (CONFIG_UDP_RECV_DELAY_MS > 0) {
+		k_sleep(K_MSEC(CONFIG_UDP_RECV_DELAY_MS));
+	}
+
 	len = recv(fd, buffer, sizeof(buffer) - 1, 0);
 	if (len > 0) {
 		good_recvs++;
 		buffer[len] = '\0';
 		printk("Received %d bytes: %s\n", len, buffer);
+	} else if (len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+		/* recv timed out (SO_RCVTIMEO) with no reply - normal for UDP over
+		 * a high-latency satellite link, not a failure.
+		 */
+		printk("No reply within recv timeout\n");
 	} else if (len < 0) {
 		printk("Receive failed, error: %d, errno: %d\n", len, errno);
 	}

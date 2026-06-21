@@ -21,6 +21,21 @@ config UDP_SERVER_PORT
 	int "UDP server port"
 	default 4242
 
+config UDP_RECV_DELAY_MS
+	int "Delay between UDP send and receive (ms)"
+	default 0
+	help
+	  Wait this many milliseconds after sending before attempting to receive
+	  the reply. Useful on high-latency NTN links where the response is not
+	  available immediately. 0 disables the delay (receive right after send).
+
+config UDP_RECV_TIMEOUT_S
+	int "UDP receive timeout (s)"
+	default 5
+	help
+	  How long recv() waits for a reply before giving up (SO_RCVTIMEO). On a
+	  timeout recv() returns -1 with errno EAGAIN, logged as "No reply".
+
 config UDP_PAYLOAD
 	string "Payload for UDP transmission"
 	default "Hello, World!"
