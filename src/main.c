@@ -239,7 +239,7 @@ static void modem_init(void)
 		       nrf_modem_at_err_type(err), nrf_modem_at_err(err));
 		return;
 	}
-	printk("Locked to NTN bands %s\n", CONFIG_NTN_BAND_LIST);
+	printk("\n\nLocked to NTN bands %s\n", CONFIG_NTN_BAND_LIST);
 
 	/* Register for modem location requests required for NTN operation. */
 	ntn_register_handler(ntn_handler);
@@ -431,7 +431,7 @@ static void udp_send_and_recv(int fd, const void *payload, size_t payload_len)
 		/* recv timed out (SO_RCVTIMEO) with no reply - normal for UDP over
 		 * a high-latency satellite link, not a failure.
 		 */
-		printk("No reply within recv timeout\n");
+		printk("** No reply within recv timeout: %ds\n", CONFIG_UDP_RECV_TIMEOUT_S);
 	} else if (len < 0) {
 		printk("Receive failed, error: %d, errno: %d\n", len, errno);
 	}
@@ -714,7 +714,7 @@ int main(void)
 {
 	int cid, pdn_id;
 
-	printk("UDP sample started\n");
+	printk("LooUQ MTC2-N9151 NTN/UDP sample started\n");
 	modem_init();
 
 	cid = udp_pdn_setup();

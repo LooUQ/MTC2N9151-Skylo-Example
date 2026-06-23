@@ -1,109 +1,45 @@
-.. _nidd_sample:
-
-Cellular: NIDD
-##############
-
-.. contents::
-   :local:
-   :depth: 2
-
-The NIDD sample demonstrates how to use Non-IP Data Delivery (NIDD) on an nRF91 Series device.
+The Skylo field-test sample demonstrates how to communicate with TagoIO using TIP protocol from the LooUQ MTC2-N9151 embedded modem.
 
 Requirements
 ************
 
-The sample supports the following development kits:
+The sample supports the following development kits: LooUQ MTC2-N9151 embedded modem
 
-.. table-from-sample-yaml::
+Support for the modem (power, GPIO, etc.) via the LooUQ Breakout or UXplor development boards is required to run the sample. Alternatively, you can use your own custom board with the modem, but you must ensure that the modem is powered and connected to the host MCU via UART. 
 
-.. include:: /includes/tfm.txt
+The necessary `board files <https://github.com/LooUQ/LooUQ-MTC2-SW/tree/main/boards>`_ are available on GitHub for the MTC2-N9151 embedded modem. 
+
+The configuration for the sample is provided in the sample's `prj.conf` file. If you are using a custom board, you may need to modify the configuration to match your board's hardware.
 
 Overview
 ********
 
-The NIDD sample creates a non-IP PDN using the configured APN and uses socket operations to send and receive data.
-You can allocate a new PDN context to allow dual stack communication (IP and non-IP).
+The Skylo sample creates a UDP configured PDN using the specified APN and uses socket operations to send and receive data. The diaglog is between the device and the TagoIO server, using the TIP protocol.
 
 .. note::
 
-   This sample requires a SIM subscription with non-IP service enabled, and LTE network configured to route the non-IP traffic to a server that is able to respond.
-   Before using the sample, check with your operator if non-IP service is supported.
-
+   This sample requires a SIM subscription with a carrier such as Monogoto (or another carrier of your choice), and LTE network configured to route the non-IP traffic to a server that is able to respond.
 
 Configuration
 *************
+The sample can be configured using numerous config options. The configuration options are defined in the sample's `prj.conf` file. You can modify the configuration options to match your requirements.
 
-|config|
-
-Configuration options
-=====================
-
-Check and configure the following configuration options for the sample:
-
-.. _CONFIG_NIDD_APN:
-
-CONFIG_NIDD_APN - APN used for NIDD connection
-   This option specifies the APN to use for the NIDD connection.
-
-.. _CONFIG_NIDD_ALLOC_NEW_CID:
-
-CONFIG_NIDD_ALLOC_NEW_CID - Allocate new context identifier for NIDD connection
-   This option, when enabled, allocates a new PDN context identifier instead of modifying the default.
-   This enables the use of NIDD together with regular IP traffic.
-
-.. CONFIG_NIDD_PAYLOAD:
-
-CONFIG_NIDD_PAYLOAD - Payload for NIDD transmission
-   This option sets the application payload to be sent as data.
-
-.. include:: /libraries/modem/nrf_modem_lib/nrf_modem_lib_trace.rst
-   :start-after: modem_lib_sending_traces_UART_start
-   :end-before: modem_lib_sending_traces_UART_end
 
 Building and running
 ********************
-
-.. |sample path| replace:: :file:`samples/cellular/nidd`
-
-.. include:: /includes/build_and_run_ns.txt
+The sample can be built and run using the Nordic Connect SDK (NCS) build system. The following instructions assume that you have already set up the NCS environment and have the necessary tools installed. 
 
 Testing
 =======
+To test the sample, follow these steps:
 
-|test_sample|
+1. Connect the development kit to your host computer and ensure that it is powered on. 
+2. Setup your terminal emulator to connect to the development kit's serial port. The default baud rate is 115200, and the default settings are 8 data bits, no parity, and 1 stop bit.
+3. Build and flash the sample to the development kit using the NCS build system.
+4. Sit back and observe the output in your terminal emulator. The sample will automatically connect to the network, create a socket, send a message, receive a response, and then close the socket. 
+5. Open your TagoIO account and navigate to the "Devices" section. You should see the device listed there, and you can view the data that was sent and received by the device. 
 
-1. |connect_kit|
-#. |connect_terminal|
-#. Observe that the sample starts and shows the following output from the device.
-   Note that this is an example, and the output need not be identical to your observed output.
-
-   .. code-block:: console
-
-      NIDD sample started
-      Configured Non-IP for APN "iot.nidd"
-      LTE cell changed: Cell ID: 21657858, Tracking area: 40401
-      RRC mode: Connected
-      Network registration status: Connected - roaming
-      Get PDN ID 0
-      Created socket 0
-      Sent 13 bytes
-      Received 14 bytes: Hello, Device!
-      Closed socket 0
-      LTE cell changed: Cell ID: -1, Tracking area: -1
-      RRC mode: Idle
-      NIDD sample done
 
 Dependencies
 ************
 
-This sample uses the following |NCS| library:
-
-* :ref:`lte_lc_readme`
-
-It uses the following `sdk-nrfxlib`_ library:
-
-* :ref:`nrfxlib:nrf_modem`
-
-The sample also uses the following secure firmware component:
-
-* :ref:`Trusted Firmware-M <ug_tfm>`
