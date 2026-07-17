@@ -1,7 +1,9 @@
 /*
- * Copyright (c) 2022 Nordic Semiconductor ASA
- *
- * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+  * Copyright (c) 2022 Nordic Semiconductor ASA
+  * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+  * 
+  * Copyright (c) 2023 LooUQ, Inc.
+  * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <errno.h>
@@ -23,8 +25,60 @@
 #include <modem/nrf_modem_lib.h>
 #include <modem/ntn.h>
 #include <nrf_modem_at.h>
+#include <nrf_modem_gnss.h>
 
 K_SEM_DEFINE(lte_connected, 0, 1);
+
+/* Given to the main thread when the GNSS receiver produces a valid fix. */
+K_SEM_DEFINE(gnss_fix_sem, 0, 1);
+
+/* Device position supplied to the modem for NTN Doppler/timing pre-compensation.
+ * In fixed mode it comes from CONFIG_NTN_LOCATION; in dynamic mode from the
+ * internal GNSS receiver.
+ */
+static double loc_lat;
+static double loc_lon;
+static float  loc_alt;
+
+/* true  = CONFIG_NTN_LOCATION supplied a valid fixed position (GNSS skipped);
+ * false = position is acquired from internal GNSS. Set once at startup.
+ */
+static bool location_is_fixed;
+
+/* Set by ntn_handler() when the modem needs a fresh location and the cached fix
+ * is too old to reuse. Handled by the main loop (dynamic mode only).
+ */
+static volatile bool refix_requested;
+
+/* Uptime (ms) of the last GNSS fix, for the NTN_REFIX_MIN_INTERVAL_S guard. */
+static int64_t last_fix_uptime;
+
+/* Time-to-first-fix (s) of the most recent GNSS acquisition, for the shell. */
+static int last_ttff_s;
+
+/* Coarse app phase, reported by "gnss status" / "udp status". */
+enum app_phase {
+	PHASE_INIT,
+	PHASE_GNSS_FIX,
+	PHASE_ATTACHING,
+	PHASE_CONNECTED,
+};
+static enum app_phase app_phase;
+
+static const char *phase_str(enum app_phase p)
+{
+	switch (p) {
+	case PHASE_GNSS_FIX:	return "acquiring GNSS fix";
+	case PHASE_ATTACHING:	return "attaching to NTN";
+	case PHASE_CONNECTED:	return "connected";
+	default:		return "init";
+	}
+}
+
+/* Latest GNSS PVT frame, filled by gnss_event_handler() in modem callback
+ * context and read by the main thread once gnss_fix_sem is given.
+ */
+static struct nrf_modem_gnss_pvt_data_frame gnss_pvt;
 
 /* UDP socket, kept open after the initial send so messages can be sent
  * manually with the "udp send <text>" shell command. -1 until registered.
@@ -86,8 +140,6 @@ static int parse_location(const char *str, double *lat, double *lon, float *alt)
 
 static void ntn_handler(const struct ntn_evt *evt)
 {
-	double lat, lon;
-	float alt;
 	int err;
 
 	switch (evt->type) {
@@ -100,20 +152,22 @@ static void ntn_handler(const struct ntn_evt *evt)
 		       evt->location_request.accuracy);
 
 		/* NTN requires the modem to know the device position for
-		 * Doppler/timing pre-compensation. A stationary device can supply
-		 * a single fixed fix (from CONFIG_NTN_LOCATION); a mobile device
-		 * would feed live GNSS fixes here instead.
+		 * Doppler/timing pre-compensation. In fixed mode the position never
+		 * changes, so answer immediately from the cached coordinates. In
+		 * dynamic mode, reuse the cached GNSS fix if it is recent enough;
+		 * otherwise ask the main loop to drop NTN and acquire a fresh fix
+		 * (internal GNSS cannot run while NTN is active).
 		 */
-		if (parse_location(CONFIG_NTN_LOCATION, &lat, &lon, &alt) != 0) {
-			printk("Invalid CONFIG_NTN_LOCATION: \"%s\"\n",
-			       CONFIG_NTN_LOCATION);
-			break;
-		}
-
-		/* validity 0 = never expires; valid for a stationary device. */
-		err = ntn_location_set(lat, lon, alt, 0);
-		if (err) {
-			printk("ntn_location_set failed, error: %d\n", err);
+		if (location_is_fixed ||
+		    (k_uptime_get() - last_fix_uptime) <
+			    (int64_t)CONFIG_NTN_REFIX_MIN_INTERVAL_S * 1000) {
+			err = ntn_location_set(loc_lat, loc_lon, loc_alt,
+					       CONFIG_NTN_LOCATION_VALIDITY_S);
+			if (err) {
+				printk("ntn_location_set failed, error: %d\n", err);
+			}
+		} else {
+			refix_requested = true;
 		}
 		break;
 	default:
@@ -180,41 +234,121 @@ static void lte_handler(const struct lte_lc_evt *const evt)
 	}
 }
 
-/* Accuracy (m) and validity (s) reported with the initial proactive location.
- * Match these to the AT%LOCATION=2 command that registers for you manually.
- * validity 0 = infinite, appropriate for a stationary device.
+/* Accuracy (m) reported with the proactive location. Match this to the
+ * AT%LOCATION=2 command that registers for you manually. The validity comes
+ * from CONFIG_NTN_LOCATION_VALIDITY_S (0 = infinite, for a stationary device).
  */
 #define NTN_LOCATION_ACCURACY_M	100
-#define NTN_LOCATION_VALIDITY_S	0
 
-/* Provide the device position to the modem proactively, before connecting.
- * With NTN the modem needs a location to acquire a satellite (Doppler/timing
- * pre-compensation) and cannot register without it, so waiting for the modem
- * to request location first deadlocks into an endless search. This mirrors a
- * manual AT%LOCATION=2 issued before AT+CFUN=1; ntn_handler() then keeps the
- * location refreshed for any later modem requests.
+/* Push the device position to the modem (AT%LOCATION=2). Done before connecting
+ * so satellite acquisition can start (otherwise NTN registration searches
+ * endlessly); ntn_handler() keeps it refreshed for later modem requests.
+ * Returns 0 on success, -1 on error.
  */
-static void set_initial_location(void)
+static int set_modem_location(double lat, double lon, float alt, int validity)
 {
-	double lat, lon;
-	float alt;
+	int err = nrf_modem_at_printf(
+		"AT%%LOCATION=2,\"%.6f\",\"%.6f\",\"%.1f\",%d,%d",
+		lat, lon, (double)alt, NTN_LOCATION_ACCURACY_M, validity);
+
+	if (err) {
+		printk("Set location failed, type: %d, error: %d\n",
+		       nrf_modem_at_err_type(err), nrf_modem_at_err(err));
+		return -1;
+	}
+	printk("NTN location set: lat %.6f, lon %.6f, alt %.1f m, validity %d s\n",
+	       lat, lon, (double)alt, validity);
+	return 0;
+}
+
+/* Called in modem library context for each GNSS event. On a valid PVT fix,
+ * cache the frame and wake the acquiring thread. Keep it short.
+ */
+static void gnss_event_handler(int event)
+{
+	if (event != NRF_MODEM_GNSS_EVT_PVT) {
+		return;
+	}
+
+	if (nrf_modem_gnss_read(&gnss_pvt, sizeof(gnss_pvt),
+				NRF_MODEM_GNSS_DATA_PVT) == 0 &&
+	    (gnss_pvt.flags & NRF_MODEM_GNSS_PVT_FLAG_FIX_VALID)) {
+		k_sem_give(&gnss_fix_sem);
+	}
+}
+
+/* Acquire a position from the internal GNSS receiver into loc_lat/lon/alt.
+ * Internal GNSS and NTN are mutually exclusive system modes, so this drops the
+ * modem to CFUN=0, switches to GNSS-only, runs a single fix, then returns the
+ * modem to CFUN=0 for the caller to re-attach to NTN. Blocks until a valid fix
+ * (CONFIG_GNSS_FIX_RETRY_S = 0) or restarts the receiver on each retry timeout.
+ * Returns 0 on success, -1 on setup error.
+ */
+static int acquire_gnss_location(void)
+{
+	int64_t start;
 	int err;
 
-	if (parse_location(CONFIG_NTN_LOCATION, &lat, &lon, &alt) != 0) {
-		printk("Invalid CONFIG_NTN_LOCATION: \"%s\"\n", CONFIG_NTN_LOCATION);
-		return;
+	printk("Acquiring GNSS fix...\n");
+	app_phase = PHASE_GNSS_FIX;
+
+	(void)nrf_modem_at_printf("AT+CFUN=0");
+
+	err = nrf_modem_at_printf("AT%%XSYSTEMMODE=0,0,1,0");
+	if (err) {
+		printk("Set GNSS system mode failed, type: %d, error: %d\n",
+		       nrf_modem_at_err_type(err), nrf_modem_at_err(err));
+		return -1;
 	}
 
-	err = nrf_modem_at_printf("AT%%LOCATION=2,\"%.6f\",\"%.6f\",\"%.1f\",%d,%d",
-				  lat, lon, (double)alt,
-				  NTN_LOCATION_ACCURACY_M, NTN_LOCATION_VALIDITY_S);
-	if (err) {
-		printk("Initial location set failed, type: %d, error: %d\n",
-		       nrf_modem_at_err_type(err), nrf_modem_at_err(err));
-		return;
+	if (nrf_modem_gnss_event_handler_set(gnss_event_handler) != 0 ||
+	    nrf_modem_gnss_fix_interval_set(0) != 0 ||	/* single fix */
+	    nrf_modem_gnss_fix_retry_set(CONFIG_GNSS_FIX_RETRY_S) != 0) {
+		printk("GNSS configuration failed\n");
+		return -1;
 	}
-	printk("Initial NTN location set from CONFIG_NTN_LOCATION: "
-	       "lat %.6f, lon %.6f, alt %.1f m\n", lat, lon, (double)alt);
+
+	/* Activate GNSS only (CFUN=31 leaves LTE untouched; it is already off). */
+	err = nrf_modem_at_printf("AT+CFUN=31");
+	if (err) {
+		printk("Activate GNSS failed, type: %d, error: %d\n",
+		       nrf_modem_at_err_type(err), nrf_modem_at_err(err));
+		return -1;
+	}
+
+	start = k_uptime_get();
+	for (;;) {
+		if (nrf_modem_gnss_start() != 0) {
+			printk("GNSS start failed\n");
+			return -1;
+		}
+
+		/* With fix_retry 0 GNSS runs until a valid fix, so K_FOREVER
+		 * pairs exactly; with a timeout, restart the receiver and retry.
+		 */
+		if (k_sem_take(&gnss_fix_sem,
+			       CONFIG_GNSS_FIX_RETRY_S == 0 ? K_FOREVER :
+			       K_SECONDS(CONFIG_GNSS_FIX_RETRY_S + 30)) == 0) {
+			break;
+		}
+
+		printk("GNSS: no fix yet, retrying\n");
+		(void)nrf_modem_gnss_stop();
+	}
+
+	loc_lat = gnss_pvt.latitude;
+	loc_lon = gnss_pvt.longitude;
+	loc_alt = gnss_pvt.altitude;
+	last_fix_uptime = k_uptime_get();
+	last_ttff_s = (int)((last_fix_uptime - start) / 1000);
+
+	printk("GNSS fix: lat %.6f, lon %.6f, alt %.1f m (TTFF %d s)\n",
+	       loc_lat, loc_lon, (double)loc_alt, last_ttff_s);
+
+	(void)nrf_modem_gnss_stop();
+	(void)nrf_modem_at_printf("AT+CFUN=0");
+
+	return 0;
 }
 
 static void modem_init(void)
@@ -229,25 +363,23 @@ static void modem_init(void)
 
 	(void)nrf_modem_at_printf("AT+CMEE=1");
 
-	/* Lock to the NTN MSS bands. Must be done while the modem is in CFUN=0
-	 * (before connect), otherwise it returns +CME ERROR 518. The band_list
-	 * form is required: bands 255/256 are above the 88-bit band_mask range.
+	/* Configure the COEX0 pin that gates the external GNSS LNA/RF path before
+	 * any RF activity. The modem stores this and toggles COEX0 automatically
+	 * per RF frequency thereafter. Board-specific; empty string skips it.
 	 */
-	err = nrf_modem_at_printf("AT%%XBANDLOCK=2,,\"%s\"", CONFIG_NTN_BAND_LIST);
-	if (err) {
-		printk("NTN band lock failed, type: %d, error: %d\n",
-		       nrf_modem_at_err_type(err), nrf_modem_at_err(err));
-		return;
+	if (strlen(CONFIG_GNSS_COEX0_CMD) > 0) {
+		err = nrf_modem_at_printf("%s", CONFIG_GNSS_COEX0_CMD);
+		if (err) {
+			printk("COEX0 config failed, type: %d, error: %d\n",
+			       nrf_modem_at_err_type(err), nrf_modem_at_err(err));
+		} else {
+			printk("COEX0 GNSS path configured: %s\n",
+			       CONFIG_GNSS_COEX0_CMD);
+		}
 	}
-	printk("\n\nLocked to NTN bands %s\n", CONFIG_NTN_BAND_LIST);
 
 	/* Register for modem location requests required for NTN operation. */
 	ntn_register_handler(ntn_handler);
-
-	/* Seed the modem with our position before connecting so satellite
-	 * acquisition can start (otherwise registration searches endlessly).
-	 */
-	set_initial_location();
 }
 
 static void modem_connect(void)
@@ -670,6 +802,42 @@ static void log_modem_status(void)
 	printk("Modem status: %s", resp);
 }
 
+/* Print the location source, current phase, position, and (dynamic mode) the
+ * age and TTFF of the last GNSS fix. Shared by "gnss status" and "udp status".
+ */
+static void log_location(void)
+{
+	printk("Location mode: %s\n",
+	       location_is_fixed ? "fixed (CONFIG_NTN_LOCATION)" :
+				   "dynamic (internal GNSS)");
+	printk("Phase: %s\n", phase_str(app_phase));
+	printk("Position: lat %.6f, lon %.6f, alt %.1f m\n",
+	       loc_lat, loc_lon, (double)loc_alt);
+
+	if (location_is_fixed) {
+		return;
+	}
+
+	if (last_fix_uptime > 0) {
+		printk("Last GNSS fix: %lld s ago, TTFF %d s\n",
+		       (k_uptime_get() - last_fix_uptime) / 1000, last_ttff_s);
+	} else {
+		printk("Last GNSS fix: none yet\n");
+	}
+}
+
+/* Shell command: report the location source, phase, and last GNSS fix. */
+static int cmd_gnss_status(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(sh);
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	log_location();
+
+	return 0;
+}
+
 /* Shell command: send a text string over the open UDP socket and print any
  * reply. Multi-word strings must be quoted, e.g. udp send "Hello, World!".
  */
@@ -694,6 +862,7 @@ static int cmd_udp_status(const struct shell *sh, size_t argc, char **argv)
 
 	log_signal_quality();
 	log_modem_status();
+	log_location();
 	log_tally();
 
 	return 0;
@@ -704,24 +873,66 @@ SHELL_STATIC_SUBCMD_SET_CREATE(udp_subcmds,
 		      "Send a text string over UDP. Usage: udp send <text>",
 		      cmd_udp_send, 2, 0),
 	SHELL_CMD(status, NULL,
-		  "Report satellite link quality (+CESQ) and modem status (%XMONITOR).",
+		  "Report link quality (+CESQ), modem status (%XMONITOR), and location.",
 		  cmd_udp_status),
 	SHELL_SUBCMD_SET_END
 );
 SHELL_CMD_REGISTER(udp, &udp_subcmds, "UDP commands", NULL);
 
-int main(void)
-{
-	int cid, pdn_id;
+SHELL_STATIC_SUBCMD_SET_CREATE(gnss_subcmds,
+	SHELL_CMD(status, NULL,
+		  "Report location source, phase, position, and last GNSS fix.",
+		  cmd_gnss_status),
+	SHELL_SUBCMD_SET_END
+);
+SHELL_CMD_REGISTER(gnss, &gnss_subcmds, "GNSS/location commands", NULL);
 
-	printk("LooUQ MTC2-N9151 NTN/UDP sample started\n");
-	modem_init();
+/* Switch the modem to NTN NB-IoT and bring up the UDP link with loc_lat/lon/alt
+ * as the seeded position: CFUN=0 -> NTN system mode -> band lock -> set location
+ * -> connect -> PDN + socket. Re-run on every (re)attach. Returns 0 on success,
+ * -1 on failure.
+ */
+static int attach_ntn(void)
+{
+	int err, cid, pdn_id;
+
+	app_phase = PHASE_ATTACHING;
+
+	/* System mode can only change at CFUN=0. Switch to NTN NB-IoT (all other
+	 * systems must be 0 for the 5th parameter to enable NTN).
+	 */
+	(void)nrf_modem_at_printf("AT+CFUN=0");
+	err = nrf_modem_at_printf("AT%%XSYSTEMMODE=0,0,0,0,1");
+	if (err) {
+		printk("Set NTN system mode failed, type: %d, error: %d\n",
+		       nrf_modem_at_err_type(err), nrf_modem_at_err(err));
+		return -1;
+	}
+
+	/* Lock to the NTN MSS bands. Must be done while in CFUN=0, otherwise it
+	 * returns +CME ERROR 518. The band_list form is required: bands 255/256 are
+	 * above the 88-bit band_mask range.
+	 */
+	err = nrf_modem_at_printf("AT%%XBANDLOCK=2,,\"%s\"", CONFIG_NTN_BAND_LIST);
+	if (err) {
+		printk("NTN band lock failed, type: %d, error: %d\n",
+		       nrf_modem_at_err_type(err), nrf_modem_at_err(err));
+		return -1;
+	}
+	printk("Locked to NTN bands %s\n", CONFIG_NTN_BAND_LIST);
+
+	/* Seed the position before connecting so satellite acquisition can start. */
+	if (set_modem_location(loc_lat, loc_lon, loc_alt,
+			       CONFIG_NTN_LOCATION_VALIDITY_S) != 0) {
+		return -1;
+	}
 
 	cid = udp_pdn_setup();
 	if (cid == -1) {
-		goto power_off;
+		return -1;
 	}
 
+	k_sem_reset(&lte_connected);
 	modem_connect();
 	k_sem_take(&lte_connected, K_FOREVER);
 
@@ -730,11 +941,52 @@ int main(void)
 
 	pdn_id = udp_pdn_activate(cid);
 	if (pdn_id == -1) {
-		goto power_off;
+		return -1;
 	}
 
 	udp_fd = udp_socket_setup(pdn_id);
 	if (udp_fd == -1) {
+		return -1;
+	}
+
+	app_phase = PHASE_CONNECTED;
+	return 0;
+}
+
+/* Tear down the NTN link (close socket, power off LTE) so the GNSS system mode
+ * can be selected for a fresh fix.
+ */
+static void detach_ntn(void)
+{
+	if (udp_fd >= 0) {
+		udp_socket_close(udp_fd);
+		udp_fd = -1;
+	}
+	lte_lc_power_off();
+}
+
+int main(void)
+{
+	printk("LooUQ MTC2-N9151 NTN/UDP sample started\n");
+	modem_init();
+
+	/* CONFIG_NTN_LOCATION set -> fixed position; empty -> acquire from GNSS. */
+	location_is_fixed =
+		(parse_location(CONFIG_NTN_LOCATION, &loc_lat, &loc_lon, &loc_alt) == 0);
+
+	if (location_is_fixed) {
+		printk("Using fixed location from CONFIG_NTN_LOCATION: "
+		       "lat %.6f, lon %.6f, alt %.1f m\n",
+		       loc_lat, loc_lon, (double)loc_alt);
+	} else {
+		printk("CONFIG_NTN_LOCATION empty; acquiring location from internal GNSS\n");
+		if (acquire_gnss_location() != 0) {
+			printk("GNSS acquisition failed; aborting\n");
+			goto power_off;
+		}
+	}
+
+	if (attach_ntn() != 0) {
 		goto power_off;
 	}
 
@@ -756,6 +1008,20 @@ int main(void)
 			udp_send_and_recv(udp_fd, payload, len);
 		}
 		log_tally();
+
+		/* The modem asked for a fresh location and the cached fix is stale.
+		 * Internal GNSS cannot run while NTN is active, so drop the link,
+		 * re-acquire, and re-attach. (Dynamic mode only.)
+		 */
+		if (!location_is_fixed && refix_requested) {
+			printk("Refreshing GNSS location on modem request\n");
+			refix_requested = false;
+			detach_ntn();
+			if (acquire_gnss_location() != 0 || attach_ntn() != 0) {
+				printk("Location refresh / re-attach failed; aborting\n");
+				goto power_off;
+			}
+		}
 
 		k_sleep(K_SECONDS(CONFIG_TEST_INTERVAL));
 	}

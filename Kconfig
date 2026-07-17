@@ -41,8 +41,48 @@ config UDP_PAYLOAD
 	default "Hello, World!"
 
 config NTN_LOCATION
-	string "Location information for NTN (lat,lon,alt)"
-	default "44.698883,-85.600258,153.025009"
+	string "Fixed NTN location (lat,lon,alt); empty = acquire from internal GNSS"
+	default ""
+	help
+	  If set to a valid "lat,lon,alt" string, this fixed position is supplied to
+	  the modem for NTN Doppler/timing pre-compensation (bench testing or sites
+	  with poor sky view). If left empty, the position is acquired dynamically
+	  from the nRF9151 internal GNSS receiver instead.
+
+config GNSS_FIX_RETRY_S
+	int "GNSS fix retry timeout (s), 0 = run until a valid fix"
+	default 0
+	help
+	  Maximum time the GNSS receiver runs while trying to produce a valid fix
+	  before giving up and restarting the attempt. 0 lets GNSS run indefinitely
+	  until it produces a valid fix (block until fix). Feeds
+	  nrf_modem_gnss_fix_retry_set().
+
+config NTN_LOCATION_VALIDITY_S
+	int "Validity (s) reported with the NTN location, 0 = infinite"
+	default 3600
+	help
+	  Validity time reported to the modem with each location update. A finite
+	  value makes the modem periodically request a fresh location; 0 means the
+	  location never expires (appropriate for a permanently stationary device).
+
+config NTN_REFIX_MIN_INTERVAL_S
+	int "Minimum interval (s) between full GNSS re-acquisitions"
+	default 600
+	help
+	  When the modem requests a fresh location (dynamic/GNSS mode), re-send the
+	  cached fix if it is newer than this, instead of dropping the NTN link to
+	  run a full GNSS re-acquisition. Bounds link interruptions on a stationary
+	  or slow-moving device.
+
+config GNSS_COEX0_CMD
+	string "COEX0 configuration command for the GNSS LNA path (empty = skip)"
+	default "AT%XCOEX0=1,1,1570,1580"
+	help
+	  AT command issued once at boot (while the modem is idle) to configure the
+	  COEX0 pin that gates the external GNSS LNA/RF switch. The board-specific
+	  value must match the MTC2-N9151 hardware. Empty string skips it (e.g. when
+	  the Modem antenna library handles COEX0 instead).
 
 config NTN_BAND_LIST
 	string "NTN band list for AT%XBANDLOCK (comma-separated)"
