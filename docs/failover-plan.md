@@ -299,8 +299,10 @@ wired. `link status` shows both override states and which source drives each.
 
 ## 8. Configuration
 
-Full explanation, worked timeline, interaction traps and tuning presets:
-**<https://claude.ai/code/artifact/80c3c8b1-aff0-4ffa-8a81-82cba3d788b3>**
+Full explanation of every symbol, a worked timeline, the interaction traps and tuning presets:
+**[failover-config.md](failover-config.md)**. A browser-readable copy of the same reference is
+published at <https://claude.ai/code/artifact/80c3c8b1-aff0-4ffa-8a81-82cba3d788b3>; the file in
+this repo is the authoritative version.
 
 New symbols, declared in `Kconfig` and set in `prj.conf`:
 
