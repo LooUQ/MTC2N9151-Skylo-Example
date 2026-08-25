@@ -19,6 +19,7 @@
 #include <arpa/inet.h>
 
 #include <zephyr/shell/shell.h>
+#include <zephyr/net/socket_ncs.h>
 
 #include <date_time.h>
 #include <modem/lte_lc.h>
@@ -32,21 +33,38 @@ K_SEM_DEFINE(lte_connected, 0, 1);
 /* Given to the main thread when the GNSS receiver produces a valid fix. */
 K_SEM_DEFINE(gnss_fix_sem, 0, 1);
 
+/* Given when the date_time library reports the outcome of a time update. */
+K_SEM_DEFINE(date_time_sem, 0, 1);
+
 /* Device position supplied to the modem for NTN Doppler/timing pre-compensation.
- * In fixed mode it comes from CONFIG_NTN_LOCATION; in dynamic mode from the
- * internal GNSS receiver.
+ * In static mode it comes from CONFIG_NTN_LOCATION; in the dynamic modes from
+ * the internal GNSS receiver.
  */
 static double loc_lat;
 static double loc_lon;
 static float  loc_alt;
 
-/* true  = CONFIG_NTN_LOCATION supplied a valid fixed position (GNSS skipped);
- * false = position is acquired from internal GNSS. Set once at startup.
+/* Location source, selected at build time by the GNSS mode choice in Kconfig:
+ *   static        - fixed CONFIG_NTN_LOCATION, GNSS never runs
+ *   dynamic-once  - one GNSS fix at boot (plus modem-requested refreshes)
+ *   dynamic-every - a fresh GNSS fix before every periodic transmission
  */
-static bool location_is_fixed;
+#define LOCATION_IS_FIXED	IS_ENABLED(CONFIG_GNSS_MODE_STATIC)
+#define LOCATION_REFIX_EVERY	IS_ENABLED(CONFIG_GNSS_MODE_DYNAMIC_EVERY)
+
+static const char *location_mode_str(void)
+{
+	if (IS_ENABLED(CONFIG_GNSS_MODE_STATIC)) {
+		return "static (CONFIG_NTN_LOCATION)";
+	}
+	if (IS_ENABLED(CONFIG_GNSS_MODE_DYNAMIC_EVERY)) {
+		return "dynamic-every (GNSS fix before each transmission)";
+	}
+	return "dynamic-once (GNSS fix at boot)";
+}
 
 /* Set by ntn_handler() when the modem needs a fresh location and the cached fix
- * is too old to reuse. Handled by the main loop (dynamic mode only).
+ * is too old to reuse. Handled by the main loop (dynamic modes only).
  */
 static volatile bool refix_requested;
 
@@ -80,6 +98,14 @@ static const char *phase_str(enum app_phase p)
  */
 static struct nrf_modem_gnss_pvt_data_frame gnss_pvt;
 
+/* RAI (Release Assistance Indication) configuration granted by the network,
+ * from the last LTE_LC_EVT_RAI_UPDATE notification (AT%RAI=2). The network
+ * advertises AS and/or CP RAI support per cell; the modem only acts on the
+ * SO_RAI socket option for the mechanisms the serving cell grants.
+ */
+static struct lte_lc_rai_cfg rai_cfg;
+static bool rai_cfg_valid;
+
 /* UDP socket, kept open after the initial send so messages can be sent
  * manually with the "udp send <text>" shell command. -1 until registered.
  */
@@ -96,6 +122,10 @@ static unsigned int good_recvs;
 /* log_tally() reads the time, but read_unix_time() is defined later with the
  * other modem helpers. */
 static int64_t read_unix_time(void);
+
+/* modem_init() registers this, but it is defined later with the startup
+ * helpers that use read_unix_time(). */
+static void date_time_evt_handler(const struct date_time_evt *evt);
 
 /* Advance past any characters that cannot start a number (quotes, commas,
  * spaces), so the CONFIG_NTN_LOCATION string can be tokenized with strtod
@@ -152,13 +182,14 @@ static void ntn_handler(const struct ntn_evt *evt)
 		       evt->location_request.accuracy);
 
 		/* NTN requires the modem to know the device position for
-		 * Doppler/timing pre-compensation. In fixed mode the position never
-		 * changes, so answer immediately from the cached coordinates. In
-		 * dynamic mode, reuse the cached GNSS fix if it is recent enough;
+		 * Doppler/timing pre-compensation. In static mode the position never
+		 * changes, so answer immediately from the cached coordinates. In the
+		 * dynamic modes, reuse the cached GNSS fix if it is recent enough;
 		 * otherwise ask the main loop to drop NTN and acquire a fresh fix
-		 * (internal GNSS cannot run while NTN is active).
+		 * (internal GNSS cannot run while NTN is active). dynamic-every
+		 * re-acquires every cycle anyway, so its cache is rarely stale.
 		 */
-		if (location_is_fixed ||
+		if (LOCATION_IS_FIXED ||
 		    (k_uptime_get() - last_fix_uptime) <
 			    (int64_t)CONFIG_NTN_REFIX_MIN_INTERVAL_S * 1000) {
 			err = ntn_location_set(loc_lat, loc_lon, loc_alt,
@@ -229,6 +260,20 @@ static void lte_handler(const struct lte_lc_evt *const evt)
 	case LTE_LC_EVT_MODEM_EVENT:
 		printk("Modem event: %d\n", evt->modem_evt.type);
 		break;
+#if defined(CONFIG_LTE_LC_RAI_MODULE)
+	case LTE_LC_EVT_RAI_UPDATE:
+		/* Tells us whether the serving cell actually grants RAI. Skylo
+		 * requires the device to release the connection with RAI, so a cell
+		 * reporting neither AS nor CP RAI is worth seeing in the log.
+		 */
+		rai_cfg = evt->rai_cfg;
+		rai_cfg_valid = true;
+		printk("RAI granted by cell %d (MCC %d, MNC %d): AS %s, CP %s\n",
+		       rai_cfg.cell_id, rai_cfg.mcc, rai_cfg.mnc,
+		       rai_cfg.as_rai ? "yes" : "no",
+		       rai_cfg.cp_rai ? "yes" : "no");
+		break;
+#endif /* CONFIG_LTE_LC_RAI_MODULE */
 	default:
 		break;
 	}
@@ -277,19 +322,15 @@ static void gnss_event_handler(int event)
 	}
 }
 
-/* Acquire a position from the internal GNSS receiver into loc_lat/lon/alt.
- * Internal GNSS and NTN are mutually exclusive system modes, so this drops the
- * modem to CFUN=0, switches to GNSS-only, runs a single fix, then returns the
- * modem to CFUN=0 for the caller to re-attach to NTN. Blocks until a valid fix
- * (CONFIG_GNSS_FIX_RETRY_S = 0) or restarts the receiver on each retry timeout.
- * Returns 0 on success, -1 on setup error.
+/* Put the modem in GNSS-only mode and activate the receiver. Internal GNSS and
+ * NTN are mutually exclusive system modes, so the caller must have dropped the
+ * NTN link first. fix_interval is passed to nrf_modem_gnss_fix_interval_set():
+ * 0 = single fix, 1 = continuous navigation. Returns 0 on success, -1 on error.
  */
-static int acquire_gnss_location(void)
+static int gnss_session_open(uint16_t fix_interval)
 {
-	int64_t start;
 	int err;
 
-	printk("Acquiring GNSS fix...\n");
 	app_phase = PHASE_GNSS_FIX;
 
 	(void)nrf_modem_at_printf("AT+CFUN=0");
@@ -301,18 +342,129 @@ static int acquire_gnss_location(void)
 		return -1;
 	}
 
-	if (nrf_modem_gnss_event_handler_set(gnss_event_handler) != 0 ||
-	    nrf_modem_gnss_fix_interval_set(0) != 0 ||	/* single fix */
-	    nrf_modem_gnss_fix_retry_set(CONFIG_GNSS_FIX_RETRY_S) != 0) {
-		printk("GNSS configuration failed\n");
-		return -1;
-	}
-
-	/* Activate GNSS only (CFUN=31 leaves LTE untouched; it is already off). */
+	/* Activate GNSS before configuring the receiver. The nrf_modem_gnss setters
+	 * return -NRF_EACCES ("GNSS is not enabled in system or functional mode")
+	 * until GNSS is active in both the system mode selected above and the
+	 * functional mode selected here, so this has to come first - the order used
+	 * by the NCS GNSS sample. CFUN=31 leaves LTE untouched; it is already off.
+	 */
 	err = nrf_modem_at_printf("AT+CFUN=31");
 	if (err) {
 		printk("Activate GNSS failed, type: %d, error: %d\n",
 		       nrf_modem_at_err_type(err), nrf_modem_at_err(err));
+		return -1;
+	}
+
+	/* Configure the receiver. Report each failure separately: the return value
+	 * is a negative NRF_E* code that says why (-1 EPERM: modem library not
+	 * initialized, -13 EACCES: GNSS not enabled in system/functional mode,
+	 * -22 EINVAL: rejected by the GNSS stack or the receiver is still running).
+	 */
+	err = nrf_modem_gnss_event_handler_set(gnss_event_handler);
+	if (err) {
+		printk("GNSS event handler set failed, error: %d\n", err);
+		return -1;
+	}
+
+	err = nrf_modem_gnss_fix_retry_set(CONFIG_GNSS_FIX_RETRY_S);
+	if (err) {
+		printk("GNSS fix retry set (%d s) failed, error: %d\n",
+		       CONFIG_GNSS_FIX_RETRY_S, err);
+		return -1;
+	}
+
+	/* Fix retry has no effect in continuous navigation mode (fix_interval 1);
+	 * it bounds the single-fix acquisitions used at boot and for refixes.
+	 */
+	err = nrf_modem_gnss_fix_interval_set(fix_interval);
+	if (err) {
+		printk("GNSS fix interval set (%u) failed, error: %d\n",
+		       fix_interval, err);
+		return -1;
+	}
+
+	return 0;
+}
+
+/* Stop the receiver and return the modem to CFUN=0, ready for the caller to
+ * select the NTN system mode again.
+ */
+static void gnss_session_close(void)
+{
+	(void)nrf_modem_gnss_stop();
+	(void)nrf_modem_at_printf("AT+CFUN=0");
+}
+
+/* Set the wall clock from the GNSS fix. The PVT frame carries UTC directly, so
+ * a fix is a complete time source needing no network, no DNS and no NTP - which
+ * matters here because the NTP path has to resolve and query two servers over a
+ * link with a 10-20 s round trip, and Skylo does not appear to push NITZ.
+ * date_time then keeps the clock running off uptime.
+ *
+ * Called on the first fix of each GNSS session, so the clock is re-disciplined
+ * to GPS every cycle. Only announced the first time, to keep the log readable.
+ */
+static void set_time_from_gnss(void)
+{
+	bool had_time = date_time_is_valid();
+	struct tm tm = {
+		.tm_year = gnss_pvt.datetime.year - 1900,
+		.tm_mon	 = gnss_pvt.datetime.month - 1,
+		.tm_mday = gnss_pvt.datetime.day,
+		.tm_hour = gnss_pvt.datetime.hour,
+		.tm_min	 = gnss_pvt.datetime.minute,
+		.tm_sec	 = gnss_pvt.datetime.seconds,
+	};
+
+	/* A valid fix should never carry a pre-GPS date; ignore it if it does
+	 * rather than poisoning the clock the payload timestamps come from.
+	 */
+	if (gnss_pvt.datetime.year < 2020) {
+		return;
+	}
+
+	if (date_time_set(&tm) != 0) {
+		printk("Setting time from GNSS failed\n");
+		return;
+	}
+
+	if (!had_time) {
+		printk("Time set from GNSS: %04u-%02u-%02u %02u:%02u:%02u UTC\n",
+		       gnss_pvt.datetime.year, gnss_pvt.datetime.month,
+		       gnss_pvt.datetime.day, gnss_pvt.datetime.hour,
+		       gnss_pvt.datetime.minute, gnss_pvt.datetime.seconds);
+	}
+}
+
+/* Copy the PVT frame cached by gnss_event_handler() into loc_lat/lon/alt and
+ * update the fix bookkeeping. start is the uptime the session began, used for
+ * the TTFF of the first fix in that session.
+ */
+static void gnss_record_fix(int64_t start, bool first_of_session)
+{
+	loc_lat = gnss_pvt.latitude;
+	loc_lon = gnss_pvt.longitude;
+	loc_alt = gnss_pvt.altitude;
+	last_fix_uptime = k_uptime_get();
+
+	if (first_of_session) {
+		last_ttff_s = (int)((last_fix_uptime - start) / 1000);
+		set_time_from_gnss();
+	}
+}
+
+/* Acquire a single position from the internal GNSS receiver. Blocks until a
+ * valid fix (CONFIG_GNSS_FIX_RETRY_S = 0) or restarts the receiver on each
+ * retry timeout. Used at boot and for modem-requested refixes.
+ * Returns 0 on success, -1 on setup error.
+ */
+static int acquire_gnss_location(void)
+{
+	int64_t start;
+
+	printk("Acquiring GNSS fix...\n");
+
+	if (gnss_session_open(0) != 0) {	/* single fix */
 		return -1;
 	}
 
@@ -336,17 +488,77 @@ static int acquire_gnss_location(void)
 		(void)nrf_modem_gnss_stop();
 	}
 
-	loc_lat = gnss_pvt.latitude;
-	loc_lon = gnss_pvt.longitude;
-	loc_alt = gnss_pvt.altitude;
-	last_fix_uptime = k_uptime_get();
-	last_ttff_s = (int)((last_fix_uptime - start) / 1000);
+	gnss_record_fix(start, true);
 
 	printk("GNSS fix: lat %.6f, lon %.6f, alt %.1f m (TTFF %d s)\n",
 	       loc_lat, loc_lon, (double)loc_alt, last_ttff_s);
 
-	(void)nrf_modem_gnss_stop();
-	(void)nrf_modem_at_printf("AT+CFUN=0");
+	gnss_session_close();
+
+	return 0;
+}
+
+/* Run the receiver in continuous navigation mode until deadline (an uptime in
+ * ms), refreshing loc_lat/lon/alt from every valid fix, so the position handed
+ * to the next NTN attach is as fresh as the link schedule allows. Individual
+ * fixes are logged at most every CONFIG_GNSS_TRACK_LOG_INTERVAL_S seconds to
+ * keep the console readable over a long tracking window.
+ *
+ * Returns 0 once the window closes (whether or not it produced a fix - the
+ * previous position stays valid and is reported), -1 on setup error.
+ */
+static int track_gnss_until(int64_t deadline)
+{
+	int64_t start = k_uptime_get();
+	int64_t last_log = 0;
+	unsigned int fixes = 0;
+
+	printk("GNSS tracking for %lld s...\n", (deadline - start) / 1000);
+
+	if (gnss_session_open(1) != 0) {	/* continuous navigation */
+		return -1;
+	}
+
+	if (nrf_modem_gnss_start() != 0) {
+		printk("GNSS start failed\n");
+		gnss_session_close();
+		return -1;
+	}
+
+	for (;;) {
+		int64_t now = k_uptime_get();
+		int64_t remaining = deadline - now;
+
+		if (remaining <= 0) {
+			break;
+		}
+
+		if (k_sem_take(&gnss_fix_sem, K_MSEC(remaining)) != 0) {
+			continue;	/* window closed before the next fix */
+		}
+
+		gnss_record_fix(start, fixes == 0);
+		fixes++;
+
+		if (fixes == 1 || CONFIG_GNSS_TRACK_LOG_INTERVAL_S == 0 ||
+		    (last_fix_uptime - last_log) >=
+			    (int64_t)CONFIG_GNSS_TRACK_LOG_INTERVAL_S * 1000) {
+			last_log = last_fix_uptime;
+			printk("GNSS fix %u: lat %.6f, lon %.6f, alt %.1f m\n",
+			       fixes, loc_lat, loc_lon, (double)loc_alt);
+		}
+	}
+
+	gnss_session_close();
+
+	if (fixes == 0) {
+		printk("GNSS tracking window closed with no fix; "
+		       "keeping previous position\n");
+	} else {
+		printk("GNSS tracking done: %u fixes, final lat %.6f, lon %.6f, "
+		       "alt %.1f m (TTFF %d s)\n",
+		       fixes, loc_lat, loc_lon, (double)loc_alt, last_ttff_s);
+	}
 
 	return 0;
 }
@@ -380,6 +592,9 @@ static void modem_init(void)
 
 	/* Register for modem location requests required for NTN operation. */
 	ntn_register_handler(ntn_handler);
+
+	/* Report time-update results for the whole session. */
+	date_time_register_handler(date_time_evt_handler);
 }
 
 static void modem_connect(void)
@@ -531,12 +746,43 @@ error_close_socket:
 	return -1;
 }
 
+/* Apply a Release Assistance Indication to the socket. RAI tells the modem when
+ * the exchange is finished so it can release the RRC connection immediately
+ * instead of idling through the network inactivity timer - Skylo requires this
+ * to tear the NTN connection down promptly. The indication is only acted on for
+ * the mechanisms the serving cell grants (see LTE_LC_EVT_RAI_UPDATE), and the
+ * modem also needs RAI enabled globally via CONFIG_LTE_RAI_REQ (AT%RAI).
+ *
+ * Compiled out entirely when CONFIG_UDP_RAI is disabled.
+ */
+static void udp_set_rai(int fd, int option, const char *what)
+{
+	if (!IS_ENABLED(CONFIG_UDP_RAI)) {
+		return;
+	}
+
+	if (setsockopt(fd, SOL_SOCKET, SO_RAI, &option, sizeof(option)) != 0) {
+		printk("Set RAI (%s) failed, errno: %d\n", what, errno);
+	}
+}
+
 static void udp_send_and_recv(int fd, const void *payload, size_t payload_len)
 {
 	char buffer[256];
+	int64_t sent_at;
+	int64_t waited;
 	ssize_t len;
 
+	/* Declare the shape of this exchange before sending: either one reply is
+	 * expected (release after it arrives) or none is (release after the send).
+	 */
+	udp_set_rai(fd, IS_ENABLED(CONFIG_UDP_RAI_EXPECT_REPLY) ? RAI_ONE_RESP :
+								  RAI_LAST,
+		    IS_ENABLED(CONFIG_UDP_RAI_EXPECT_REPLY) ? "one response" :
+							      "last packet");
+
 	len = send(fd, payload, payload_len, 0);
+	sent_at = k_uptime_get();
 	if (len == (ssize_t)payload_len) {
 		good_sends++;
 		printk("Sent %d bytes: %.*s\n", len, (int)payload_len,
@@ -555,18 +801,33 @@ static void udp_send_and_recv(int fd, const void *payload, size_t payload_len)
 	}
 
 	len = recv(fd, buffer, sizeof(buffer) - 1, 0);
+
+	/* Time from the send completing to the reply (or to giving up), including
+	 * CONFIG_UDP_RECV_DELAY_MS. This is the number to size
+	 * CONFIG_UDP_RECV_TIMEOUT_S from: if replies land at 20 s the timeout has
+	 * to clear that, and if none ever land no timeout will help.
+	 */
+	waited = k_uptime_get() - sent_at;
+
 	if (len > 0) {
 		good_recvs++;
 		buffer[len] = '\0';
-		printk("Received %d bytes: %s\n", len, buffer);
+		printk("Received %d bytes after %lld.%01lld s: %s\n", len,
+		       waited / 1000, (waited % 1000) / 100, buffer);
 	} else if (len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
 		/* recv timed out (SO_RCVTIMEO) with no reply - normal for UDP over
 		 * a high-latency satellite link, not a failure.
 		 */
-		printk("** No reply within recv timeout: %ds\n", CONFIG_UDP_RECV_TIMEOUT_S);
+		printk("** No reply within recv timeout: %ds (waited %lld.%01lld s)\n",
+		       CONFIG_UDP_RECV_TIMEOUT_S, waited / 1000, (waited % 1000) / 100);
 	} else if (len < 0) {
 		printk("Receive failed, error: %d, errno: %d\n", len, errno);
 	}
+
+	/* Exchange over: tell the modem no more data is coming so it can release
+	 * the connection now rather than waiting out the inactivity timer.
+	 */
+	udp_set_rai(fd, RAI_NO_DATA, "no more data");
 }
 
 /* Print the running send/receive tallies, prefixed with the current time as
@@ -761,6 +1022,16 @@ static int render_payload(char *out, size_t out_size, unsigned int counter)
 		case 's':
 			w = snprintf(out + n, out_size - n, "%d", have_snr ? snr_db : 0);
 			break;
+		case 'l':
+			/* Bare "lat,lon" so the template supplies the variable it
+			 * belongs to - TagoIO TIP takes it as "location@=%l", and the
+			 * same token also works appended to another variable's value.
+			 * Always current: the position is set before the first send in
+			 * every location mode.
+			 */
+			w = snprintf(out + n, out_size - n, "%.6f,%.6f",
+				     loc_lat, loc_lon);
+			break;
 		case '%':
 			w = snprintf(out + n, out_size - n, "%%");
 			break;
@@ -802,19 +1073,42 @@ static void log_modem_status(void)
 	printk("Modem status: %s", resp);
 }
 
-/* Print the location source, current phase, position, and (dynamic mode) the
+/* Report the RAI configuration in use: what this build asks for, and what the
+ * serving cell last said it grants (%RAI notification). "not reported yet" means
+ * no notification has arrived - expected before registration, or on modem
+ * firmware that does not send them.
+ */
+static void log_rai_status(void)
+{
+	if (!IS_ENABLED(CONFIG_UDP_RAI)) {
+		printk("RAI: disabled in this build (CONFIG_UDP_RAI=n)\n");
+		return;
+	}
+
+	printk("RAI: requesting %s per send, release after exchange\n",
+	       IS_ENABLED(CONFIG_UDP_RAI_EXPECT_REPLY) ? "RAI_ONE_RESP" : "RAI_LAST");
+
+	if (IS_ENABLED(CONFIG_LTE_LC_RAI_MODULE) && rai_cfg_valid) {
+		printk("RAI granted by cell %d (MCC %d, MNC %d): AS %s, CP %s\n",
+		       rai_cfg.cell_id, rai_cfg.mcc, rai_cfg.mnc,
+		       rai_cfg.as_rai ? "yes" : "no",
+		       rai_cfg.cp_rai ? "yes" : "no");
+	} else {
+		printk("RAI granted by network: not reported yet\n");
+	}
+}
+
+/* Print the location source, current phase, position, and (dynamic modes) the
  * age and TTFF of the last GNSS fix. Shared by "gnss status" and "udp status".
  */
 static void log_location(void)
 {
-	printk("Location mode: %s\n",
-	       location_is_fixed ? "fixed (CONFIG_NTN_LOCATION)" :
-				   "dynamic (internal GNSS)");
+	printk("Location mode: %s\n", location_mode_str());
 	printk("Phase: %s\n", phase_str(app_phase));
 	printk("Position: lat %.6f, lon %.6f, alt %.1f m\n",
 	       loc_lat, loc_lon, (double)loc_alt);
 
-	if (location_is_fixed) {
+	if (LOCATION_IS_FIXED) {
 		return;
 	}
 
@@ -862,6 +1156,7 @@ static int cmd_udp_status(const struct shell *sh, size_t argc, char **argv)
 
 	log_signal_quality();
 	log_modem_status();
+	log_rai_status();
 	log_location();
 	log_tally();
 
@@ -965,30 +1260,166 @@ static void detach_ntn(void)
 	lte_lc_power_off();
 }
 
+/* Drop the NTN link, take a fresh GNSS fix, and re-attach with it. Internal
+ * GNSS and NTN cannot run at the same time, so every location refresh costs a
+ * full detach/re-attach cycle. Returns 0 on success, -1 if the fix or the
+ * re-attach failed. Dynamic modes only.
+ */
+static int refresh_location(void)
+{
+	detach_ntn();
+
+	if (acquire_gnss_location() != 0 || attach_ntn() != 0) {
+		return -1;
+	}
+
+	return 0;
+}
+
+/* dynamic-every duty cycle, run after each transmission: drop the NTN link and
+ * track GNSS continuously until deadline (the next transmission slot), then
+ * re-attach with the freshest position. deadline is an uptime in ms.
+ *
+ * The exchange ends with RAI_NO_DATA, so the modem has already released the
+ * connection by the time this runs - no hold-off is needed before switching the
+ * system mode over to GNSS.
+ *
+ * Returns 0 on success, -1 if GNSS setup or the re-attach failed.
+ */
+static int gnss_duty_cycle(int64_t deadline)
+{
+	/* The whole remainder of the interval belongs to GNSS. If the exchange
+	 * itself consumed it, there is nothing to track: stay attached and send
+	 * again rather than churning the link.
+	 */
+	if (deadline - k_uptime_get() <= 0) {
+		printk("Exchange consumed the interval; skipping GNSS "
+		       "(raise CONFIG_TEST_INTERVAL)\n");
+		return 0;
+	}
+
+	detach_ntn();
+
+	if (track_gnss_until(deadline) != 0) {
+		return -1;
+	}
+
+	return attach_ntn();
+}
+
+/* Report the outcome of every date_time update, including the periodic ones the
+ * library runs on its own. Without this the whole time subsystem is silent: the
+ * app has no logging backend for the library's LOG_* output, so a failed sync
+ * only ever showed up as "ts:=0" in the payload.
+ */
+static void date_time_evt_handler(const struct date_time_evt *evt)
+{
+	switch (evt->type) {
+	case DATE_TIME_OBTAINED_MODEM:
+		printk("Time obtained from modem network time (NITZ)\n");
+		break;
+	case DATE_TIME_OBTAINED_NTP:
+		printk("Time obtained from NTP\n");
+		break;
+	case DATE_TIME_OBTAINED_EXT:
+		printk("Time obtained from external source\n");
+		break;
+	case DATE_TIME_NOT_OBTAINED:
+		printk("Time NOT obtained; %%t will stay 0 until a later update "
+		       "succeeds\n");
+		break;
+	default:
+		break;
+	}
+
+	k_sem_give(&date_time_sem);
+}
+
+/* Acquire wall-clock time once, while the link is up. There is no battery RTC,
+ * so date_time starts with nothing; after this succeeds the library keeps the
+ * clock running off uptime, and %t is good for the rest of the session.
+ *
+ * This has to happen here rather than being left to the library's automatic
+ * update: in dynamic-every the NTN link is released right after each exchange,
+ * so a background NTP fetch never gets a window to complete in.
+ */
+static void sync_time(void)
+{
+	int64_t epoch;
+
+	if (CONFIG_TIME_SYNC_WAIT_S == 0) {
+		return;
+	}
+
+	/* The dynamic modes fix GNSS before the first attach, so the clock is
+	 * already set by the time we get here and there is nothing to wait for.
+	 * Only static mode (GNSS never runs) needs the network for time.
+	 */
+	if (date_time_is_valid()) {
+		printk("Time already set from GNSS; skipping network time update\n");
+		return;
+	}
+
+	printk("Acquiring network time (up to %d s)...\n", CONFIG_TIME_SYNC_WAIT_S);
+
+	k_sem_reset(&date_time_sem);
+	if (date_time_update_async(NULL) != 0) {
+		printk("Time update request failed\n");
+		return;
+	}
+
+	if (k_sem_take(&date_time_sem, K_SECONDS(CONFIG_TIME_SYNC_WAIT_S)) != 0) {
+		printk("Time update did not complete within %d s\n",
+		       CONFIG_TIME_SYNC_WAIT_S);
+		return;
+	}
+
+	epoch = read_unix_time();
+	if (epoch > 0) {
+		time_t t = (time_t)epoch;
+		struct tm tm;
+		char when[32];
+
+		gmtime_r(&t, &tm);
+		strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S UTC", &tm);
+		printk("Time set: %s (epoch %lld)\n", when, (long long)epoch);
+	}
+}
+
 int main(void)
 {
 	printk("LooUQ MTC2-N9151 NTN/UDP sample started\n");
 	modem_init();
 
-	/* CONFIG_NTN_LOCATION set -> fixed position; empty -> acquire from GNSS. */
-	location_is_fixed =
-		(parse_location(CONFIG_NTN_LOCATION, &loc_lat, &loc_lon, &loc_alt) == 0);
+	printk("Location mode: %s\n", location_mode_str());
 
-	if (location_is_fixed) {
+	/* Static mode needs a parsable CONFIG_NTN_LOCATION; the dynamic modes seed
+	 * the position from GNSS before the first attach (both of them: NTN cannot
+	 * register without a position, so dynamic-every also fixes at boot).
+	 */
+	if (LOCATION_IS_FIXED) {
+		if (parse_location(CONFIG_NTN_LOCATION, &loc_lat, &loc_lon,
+				   &loc_alt) != 0) {
+			printk("CONFIG_NTN_LOCATION (\"%s\") is not a valid "
+			       "\"lat,lon,alt\" string; aborting\n", CONFIG_NTN_LOCATION);
+			goto power_off;
+		}
 		printk("Using fixed location from CONFIG_NTN_LOCATION: "
 		       "lat %.6f, lon %.6f, alt %.1f m\n",
 		       loc_lat, loc_lon, (double)loc_alt);
-	} else {
-		printk("CONFIG_NTN_LOCATION empty; acquiring location from internal GNSS\n");
-		if (acquire_gnss_location() != 0) {
-			printk("GNSS acquisition failed; aborting\n");
-			goto power_off;
-		}
+	} else if (acquire_gnss_location() != 0) {
+		printk("GNSS acquisition failed; aborting\n");
+		goto power_off;
 	}
 
 	if (attach_ntn() != 0) {
 		goto power_off;
 	}
+
+	/* Get the clock while the link is up, so the first payload already carries
+	 * a real %t timestamp.
+	 */
+	sync_time();
 
 	/* Send a freshly rendered CONFIG_TEST_TEMPLATE payload every
 	 * CONFIG_TEST_INTERVAL seconds. The socket stays open between sends, so
@@ -996,9 +1427,15 @@ int main(void)
 	 */
 	printk("Sending every %d s. Manual send still available: udp send <text>\n",
 	       CONFIG_TEST_INTERVAL);
+	if (LOCATION_REFIX_EVERY) {
+		printk("Each cycle: send, release with RAI, then GNSS tracking until "
+		       "the next send\n");
+	}
 
 	for (unsigned int counter = 0; ; counter++) {
 		char payload[256];
+		int64_t deadline = k_uptime_get() +
+				   (int64_t)CONFIG_TEST_INTERVAL * 1000;
 		int len = render_payload(payload, sizeof(payload), counter);
 
 		total_cycles++;
@@ -1009,15 +1446,27 @@ int main(void)
 		}
 		log_tally();
 
+		/* dynamic-every: spend the rest of the interval on continuous GNSS
+		 * tracking, so the next send goes out on a just-acquired position.
+		 * The boot fix covers the first one.
+		 */
+		if (LOCATION_REFIX_EVERY) {
+			if (gnss_duty_cycle(deadline) != 0) {
+				printk("GNSS duty cycle / re-attach failed; aborting\n");
+				goto power_off;
+			}
+			continue;	/* the duty cycle consumed the interval */
+		}
+
 		/* The modem asked for a fresh location and the cached fix is stale.
 		 * Internal GNSS cannot run while NTN is active, so drop the link,
-		 * re-acquire, and re-attach. (Dynamic mode only.)
+		 * re-acquire, and re-attach. (dynamic-once only; dynamic-every
+		 * already refreshes every cycle.)
 		 */
-		if (!location_is_fixed && refix_requested) {
+		if (!LOCATION_IS_FIXED && refix_requested) {
 			printk("Refreshing GNSS location on modem request\n");
 			refix_requested = false;
-			detach_ntn();
-			if (acquire_gnss_location() != 0 || attach_ntn() != 0) {
+			if (refresh_location() != 0) {
 				printk("Location refresh / re-attach failed; aborting\n");
 				goto power_off;
 			}

@@ -36,18 +36,82 @@ config UDP_RECV_TIMEOUT_S
 	  How long recv() waits for a reply before giving up (SO_RCVTIMEO). On a
 	  timeout recv() returns -1 with errno EAGAIN, logged as "No reply".
 
+config UDP_RAI
+	bool "Use Release Assistance Indication (RAI) on the UDP socket"
+	default y
+	help
+	  Set the SO_RAI socket option around each send/receive exchange so the modem
+	  releases the RRC connection as soon as the exchange is done, instead of
+	  idling until the network inactivity timer expires. Skylo requires RAI to
+	  tear the NTN connection down. Also needs CONFIG_LTE_RAI_REQ=y, which makes
+	  lte_link_control enable RAI in the modem (AT%RAI) and report what the
+	  serving cell grants.
+
+config UDP_RAI_EXPECT_REPLY
+	bool "Expect one reply per send (RAI_ONE_RESP)"
+	depends on UDP_RAI
+	default y
+	help
+	  Send RAI_ONE_RESP before each transmission, so the modem releases the
+	  connection once the single expected reply has been received. Disable if the
+	  server never replies: RAI_LAST is then sent instead and the connection is
+	  released right after the uplink packet.
+
 config UDP_PAYLOAD
 	string "Payload for UDP transmission"
 	default "Hello, World!"
 
+choice
+	prompt "Location source for NTN Doppler/timing pre-compensation"
+	default GNSS_MODE_STATIC
+	help
+	  How the device position supplied to the modem (AT%LOCATION=2) is obtained.
+
+config GNSS_MODE_STATIC
+	bool "static - fixed position from CONFIG_NTN_LOCATION"
+	help
+	  Use the fixed "lat,lon,alt" position configured in CONFIG_NTN_LOCATION and
+	  never run the internal GNSS receiver. For bench testing, sites with poor
+	  sky view, and permanently stationary installations.
+
+config GNSS_MODE_DYNAMIC_ONCE
+	bool "dynamic-once - acquire a GNSS fix at boot"
+	help
+	  Acquire the position from the internal GNSS receiver once at startup, then
+	  reuse it. If the modem later requests a fresh location and the cached fix
+	  is older than CONFIG_NTN_REFIX_MIN_INTERVAL_S, the NTN link is dropped for
+	  a full re-acquisition.
+
+config GNSS_MODE_DYNAMIC_EVERY
+	bool "dynamic-every - track GNSS between transmissions"
+	help
+	  Duty-cycle the modem between NTN and GNSS, so every transmission carries a
+	  just-acquired position. Each CONFIG_TEST_INTERVAL runs: send/receive,
+	  release the connection with RAI, then drop the link and run GNSS in
+	  continuous navigation mode for the rest of the interval, re-attaching with
+	  the freshest fix for the next send. Internal GNSS and NTN are mutually
+	  exclusive system modes, so this costs a full detach/re-attach per cycle:
+	  use only with an interval long enough to absorb it.
+
+endchoice
+
+config GNSS_TRACK_LOG_INTERVAL_S
+	int "Minimum interval (s) between logged fixes while tracking"
+	default 30
+	help
+	  Used by GNSS_MODE_DYNAMIC_EVERY only. Continuous navigation produces a fix
+	  every second; log at most one per this many seconds to keep the console
+	  readable. The first fix of each tracking window is always logged, as is the
+	  final position when the window closes. 0 logs every fix.
+
 config NTN_LOCATION
-	string "Fixed NTN location (lat,lon,alt); empty = acquire from internal GNSS"
+	string "Fixed NTN location (lat,lon,alt), used in static mode"
 	default ""
 	help
-	  If set to a valid "lat,lon,alt" string, this fixed position is supplied to
-	  the modem for NTN Doppler/timing pre-compensation (bench testing or sites
-	  with poor sky view). If left empty, the position is acquired dynamically
-	  from the nRF9151 internal GNSS receiver instead.
+	  Fixed "lat,lon,alt" position (decimal degrees, altitude in meters) supplied
+	  to the modem for NTN Doppler/timing pre-compensation. Required by
+	  GNSS_MODE_STATIC; ignored by the dynamic modes, which get the position from
+	  the nRF9151 internal GNSS receiver instead.
 
 config GNSS_FIX_RETRY_S
 	int "GNSS fix retry timeout (s), 0 = run until a valid fix"
@@ -70,10 +134,11 @@ config NTN_REFIX_MIN_INTERVAL_S
 	int "Minimum interval (s) between full GNSS re-acquisitions"
 	default 600
 	help
-	  When the modem requests a fresh location (dynamic/GNSS mode), re-send the
-	  cached fix if it is newer than this, instead of dropping the NTN link to
-	  run a full GNSS re-acquisition. Bounds link interruptions on a stationary
-	  or slow-moving device.
+	  When the modem requests a fresh location in GNSS_MODE_DYNAMIC_ONCE, re-send
+	  the cached fix if it is newer than this, instead of dropping the NTN link
+	  to run a full GNSS re-acquisition. Bounds link interruptions on a
+	  stationary or slow-moving device. Unused in the other modes:
+	  GNSS_MODE_DYNAMIC_EVERY already refreshes the fix every cycle.
 
 config GNSS_COEX0_CMD
 	string "COEX0 configuration command for the GNSS LNA path (empty = skip)"
@@ -87,6 +152,19 @@ config GNSS_COEX0_CMD
 config NTN_BAND_LIST
 	string "NTN band list for AT%XBANDLOCK (comma-separated)"
 	default "23,255,256"
+
+config TIME_SYNC_WAIT_S
+	int "Seconds to wait at startup for network time (0 = do not wait)"
+	default 120
+	help
+	  After the first NTN attach, request a date_time update and block until it
+	  reports a result or this timeout expires. There is no battery RTC, so the
+	  clock starts unset and the %t payload token renders 0 until a source is
+	  found; once obtained, date_time keeps the clock running from uptime for the
+	  rest of the session. Worth doing explicitly because GNSS_MODE_DYNAMIC_EVERY
+	  releases the link right after each exchange, leaving the library's own
+	  background update no window to finish an NTP query in. 0 skips the wait and
+	  leaves time to whatever the library manages on its own.
 
 config TEST_NAME
     string "Test name to use in the payload"
@@ -117,6 +195,8 @@ config TEST_PAYLOADTEMPLATE
         %q  RSRQ in dB  (0 if not detectable)
         %s  SNR in dB from %XMONITOR (0 if not available)
         %t  Unix epoch seconds from modem time (0 if network time unset)
+        %l  position as "lat,lon" in decimal degrees, 6 places (for the
+            TagoIO TIP location field, e.g. "location@=%l")
         %%  a literal '%'
 
 endmenu
