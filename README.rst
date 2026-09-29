@@ -24,6 +24,8 @@ Configuration
 *************
 The sample can be configured using numerous config options. The configuration options are defined in the sample's `prj.conf` file. You can modify the configuration options to match your requirements.
 
+TagoIO credentials are kept out of the repository. Copy `secrets.conf.example` to `secrets.conf` and set `CONFIG_TAGO_DEVICE_TOKEN` and `CONFIG_TAGO_HASH`. `secrets.conf` is ignored by git and merged into the build automatically.
+
 
 Building and running
 ********************

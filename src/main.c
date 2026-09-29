@@ -1389,6 +1389,10 @@ static void sync_time(void)
 int main(void)
 {
 	printk("LooUQ MTC2-N9151 NTN/UDP sample started\n");
+	if (strlen(CONFIG_TAGO_DEVICE_TOKEN) == 0 || strlen(CONFIG_TAGO_HASH) == 0) {
+		printk("WARNING: TagoIO token/hash not set; copy secrets.conf.example "
+		       "to secrets.conf and rebuild\n");
+	}
 	modem_init();
 
 	printk("Location mode: %s\n", location_mode_str());

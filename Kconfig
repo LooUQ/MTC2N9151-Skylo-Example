@@ -176,11 +176,15 @@ config TEST_INTERVAL
 
 config TAGO_DEVICE_TOKEN
     string "Device identifier token for payloads"
-    default "355025937426409"
+    default ""
+    help
+      Set in secrets.conf (not committed); see secrets.conf.example.
 
 config TAGO_HASH
     string "Device hash token for payloads"
-    default "ae82ad617197d3b0"
+    default ""
+    help
+      Set in secrets.conf (not committed); see secrets.conf.example.
 
 config TEST_PAYLOADTEMPLATE
     string "Payload template sent every TEST_INTERVAL seconds"

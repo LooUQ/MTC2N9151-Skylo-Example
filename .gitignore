@@ -8,3 +8,5 @@
 # build
 /build*/
 
+# local credentials (see secrets.conf.example)
+/secrets.conf
