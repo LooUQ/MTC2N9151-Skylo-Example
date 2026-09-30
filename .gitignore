@@ -10,3 +10,6 @@
 
 # local credentials (see secrets.conf.example)
 /secrets.conf
+
+# local test logs (may contain credentials)
+testlog*.txt
